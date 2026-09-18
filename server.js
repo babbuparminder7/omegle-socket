@@ -1,76 +1,134 @@
-// server.js - Node.js WebSocket Broadcast Server
-
 const { createServer } = require('http');
 const { WebSocketServer, WebSocket } = require('ws');
 
-// 1. Dynamic Port Binding (Required for Render)
 const PORT = process.env.PORT || 3000;
-
-// 2. Create basic HTTP Server
-const server = createServer((req, res) => {
-  res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('WebSocket Server is Live');
-});
-
-// 3. Attach WebSocket Server to HTTP Instance
+const server = createServer();
 const wss = new WebSocketServer({ server });
 
-console.log('Initializing WebSocket Server...');
+// --- State Management ---
+// Track all users and their current metadata
+const users = new Map(); 
+// Array to hold users waiting for a stranger
+let waitingQueue = []; 
 
-// 4. Handle Client Connections
-wss.on('connection', (ws, req) => {
-  const clientIp = req.headers['x-forwarded-for'] || req.socket.remoteAddress;
-  console.log(`[+] New client connected from: ${clientIp}`);
+// Helper to broadcast to all connected clients
+function broadcast(channel, data) {
+  const payload = JSON.stringify({ channel, data });
+  wss.clients.forEach(client => {
+    if (client.readyState === WebSocket.OPEN) client.send(payload);
+  });
+}
 
-  // Handle incoming messages from clients
+// --- WebSocket Event Handling ---
+wss.on('connection', (ws) => {
+  // Initialize user state
+  users.set(ws, { id: Date.now(), partner: null, country: null });
+
   ws.on('message', (rawMessage) => {
     try {
-      // Parse incoming payload
-      const messageStr = rawMessage.toString();
-      const parsed = JSON.parse(messageStr);
+      const parsed = JSON.parse(rawMessage.toString());
+      const { channel, data } = parsed;
+      const user = users.get(ws);
 
-      console.log(`[Message Received] Channel: "${parsed.channel}"`, parsed.data || '');
+      switch (channel) {
+        
+        // 1. Meta Events
+        case 'heartbeat':
+        case 'userActive':
+        case 'userAFK':
+          // Acknowledge or update activity timestamps internally
+          break;
 
-      // Broadcast payload to all connected clients
-      wss.clients.forEach((client) => {
-        if (client.readyState === WebSocket.OPEN) {
-          client.send(JSON.stringify({
-            channel: parsed.channel || 'chat',
-            data: parsed.data || parsed
-          }));
-        }
-      });
+        case 'peopleOnline':
+          // Send total online count back to the requester
+          ws.send(JSON.stringify({ channel: 'peopleOnline', data: users.size }));
+          break;
 
+        case 'selfCountry':
+          // Save the user's country preference
+          user.country = data;
+          break;
+
+        // 2. Matchmaking Engine
+        case 'match':
+          // If already paired, disconnect the old partner first
+          if (user.partner) {
+            user.partner.send(JSON.stringify({ channel: 'disconnect', data: '' }));
+            users.get(user.partner).partner = null;
+            user.partner = null;
+          }
+
+          if (waitingQueue.length > 0) {
+            // Match found! Pop the first user from the queue
+            const stranger = waitingQueue.shift();
+            
+            // Pair them up in the state map
+            user.partner = stranger;
+            users.get(stranger).partner = ws;
+
+            // Notify both clients they are connected
+            const connectedPayload = JSON.stringify({ channel: 'connected', data: [] });
+            ws.send(connectedPayload);
+            stranger.send(connectedPayload);
+
+            // Swap country info if available
+            if (users.get(stranger).country) {
+              ws.send(JSON.stringify({ channel: 'peerCountry', data: users.get(stranger).country }));
+            }
+            if (user.country) {
+              stranger.send(JSON.stringify({ channel: 'peerCountry', data: user.country }));
+            }
+
+          } else {
+            // No one waiting. Add self to the queue.
+            if (!waitingQueue.includes(ws)) {
+              waitingQueue.push(ws);
+            }
+          }
+          break;
+
+        // 3. 1-on-1 Chat Routing
+        case 'message':
+        case 'typing':
+          // If the user has a partner, forward the message ONLY to them
+          if (user.partner && user.partner.readyState === WebSocket.OPEN) {
+            user.partner.send(JSON.stringify({ channel, data }));
+          }
+          break;
+
+        case 'disconnect':
+          // User manually skipped/disconnected
+          if (user.partner) {
+            user.partner.send(JSON.stringify({ channel: 'disconnect', data: '' }));
+            users.get(user.partner).partner = null;
+            user.partner = null;
+          }
+          break;
+      }
     } catch (err) {
-      console.error('Failed to parse or broadcast message:', err.message);
+      console.error('Invalid JSON received:', err.message);
     }
   });
 
-  // Handle errors
-  ws.on('error', (error) => {
-    console.error('[-] Client connection error:', error);
-  });
-
-  // Handle disconnects
   ws.on('close', () => {
-    console.log('[-] Client disconnected');
-  });
-});
-
-// 5. Keep connections alive (30-second ping interval to prevent Render sleeping)
-const heartbeat = setInterval(() => {
-  wss.clients.forEach((client) => {
-    if (client.readyState === WebSocket.OPEN) {
-      client.ping();
+    const user = users.get(ws);
+    
+    // Remove from waiting queue if they were in it
+    waitingQueue = waitingQueue.filter(client => client !== ws);
+    
+    // Notify partner if they were in an active chat
+    if (user && user.partner && user.partner.readyState === WebSocket.OPEN) {
+      user.partner.send(JSON.stringify({ channel: 'disconnect', data: '' }));
+      users.get(user.partner).partner = null;
     }
+    
+    users.delete(ws);
+    
+    // Broadcast new user count
+    broadcast('peopleOnline', users.size);
   });
-}, 30000);
-
-wss.on('close', () => {
-  clearInterval(heartbeat);
 });
 
-// 6. Start listening
 server.listen(PORT, () => {
-  console.log(`Server is running and listening on port ${PORT}`);
+  console.log(`WebSocket Matchmaking Server listening on port ${PORT}`);
 });
