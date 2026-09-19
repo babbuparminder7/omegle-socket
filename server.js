@@ -5,11 +5,10 @@ const PORT = process.env.PORT || 3000;
 const server = createServer();
 const wss = new WebSocketServer({ server });
 
-// --- State Management ---
-// Track all users and their current metadata
-const users = new Map(); 
+// Track all connected users and their metadata
+const users = new Map();
 // Array to hold users waiting for a stranger
-let waitingQueue = []; 
+let waitingQueue = [];
 
 // Helper to broadcast to all connected clients
 function broadcast(channel, data) {
@@ -19,10 +18,25 @@ function broadcast(channel, data) {
   });
 }
 
-// --- WebSocket Event Handling ---
+// Helper to send messages safely
+function send(ws, channel, data) {
+  if (ws.readyState === WebSocket.OPEN) {
+    ws.send(JSON.stringify({ channel, data }));
+  }
+}
+
 wss.on('connection', (ws) => {
   // Initialize user state
-  users.set(ws, { id: Date.now(), partner: null, country: null });
+  users.set(ws, { 
+    id: Date.now(), 
+    partner: null, 
+    country: null,
+    countryName: null,
+    msgCount: 0 // Used for spam mitigation
+  });
+
+  // Notify everyone a new user joined
+  broadcast('peopleOnline', users.size);
 
   ws.on('message', (rawMessage) => {
     try {
@@ -32,99 +46,153 @@ wss.on('connection', (ws) => {
 
       switch (channel) {
         
-        // 1. Meta Events
+        // --- 1. Meta & Status Events ---
         case 'heartbeat':
-        case 'userActive':
-        case 'userAFK':
-          // Acknowledge or update activity timestamps internally
+          // The client pings periodically to keep the connection alive. No response needed.
           break;
 
         case 'peopleOnline':
-          // Send total online count back to the requester
-          ws.send(JSON.stringify({ channel: 'peopleOnline', data: users.size }));
+          send(ws, 'peopleOnline', users.size);
           break;
 
         case 'selfCountry':
-          // Save the user's country preference
-          user.country = data;
+          if (data && data.country) {
+            user.country = data.country;
+            user.countryName = data.countryName;
+          }
           break;
 
-        // 2. Matchmaking Engine
-        case 'match':
-          // If already paired, disconnect the old partner first
+        case 'userAFK':
+          // Forward AFK status to the partner if connected
           if (user.partner) {
-            user.partner.send(JSON.stringify({ channel: 'disconnect', data: '' }));
-            users.get(user.partner).partner = null;
+            send(user.partner, 'peerAFK', { 
+              timestamp: data.timestamp, 
+              reason: data.reason, 
+              gracePeriodMinutes: 8 
+            });
+          }
+          break;
+
+        case 'userActive':
+          if (user.partner) {
+            send(user.partner, 'peerActive', { 
+              timestamp: data.timestamp, 
+              reason: data.reason, 
+              afkDurationSeconds: 0 
+            });
+          }
+          break;
+
+
+        // --- 2. Matchmaking Engine ---
+        case 'match':
+          // Disconnect existing partner if matched
+          if (user.partner) {
+            send(user.partner, 'disconnect', '');
+            const partnerData = users.get(user.partner);
+            if (partnerData) partnerData.partner = null;
             user.partner = null;
           }
 
+          // Remove self from queue to prevent self-matching
+          waitingQueue = waitingQueue.filter(client => client !== ws);
+          user.msgCount = 0; // Reset spam counter for new match
+
+          // Extract match parameters
+          const preferSameCountry = data?.params?.preferSameCountry;
+          const interests = data?.params?.interests || [];
+
           if (waitingQueue.length > 0) {
-            // Match found! Pop the first user from the queue
-            const stranger = waitingQueue.shift();
-            
-            // Pair them up in the state map
+            let strangerIndex = 0;
+
+            // Optional: Implement logic here to loop through waitingQueue 
+            // and find someone with a matching country or interests.
+            // For now, it grabs the first person in the queue.
+            const stranger = waitingQueue.splice(strangerIndex, 1)[0];
+            const strangerData = users.get(stranger);
+
+            // Pair them up
             user.partner = stranger;
-            users.get(stranger).partner = ws;
+            strangerData.partner = ws;
 
             // Notify both clients they are connected
-            const connectedPayload = JSON.stringify({ channel: 'connected', data: [] });
-            ws.send(connectedPayload);
-            stranger.send(connectedPayload);
+            send(ws, 'connected', []);
+            send(stranger, 'connected', []);
 
-            // Swap country info if available
-            if (users.get(stranger).country) {
-              ws.send(JSON.stringify({ channel: 'peerCountry', data: users.get(stranger).country }));
+            // Swap country info
+            if (strangerData.country) {
+              send(ws, 'peerCountry', { country: strangerData.country, countryName: strangerData.countryName });
             }
             if (user.country) {
-              stranger.send(JSON.stringify({ channel: 'peerCountry', data: user.country }));
+              send(stranger, 'peerCountry', { country: user.country, countryName: user.countryName });
             }
-
           } else {
             // No one waiting. Add self to the queue.
-            if (!waitingQueue.includes(ws)) {
-              waitingQueue.push(ws);
+            waitingQueue.push(ws);
+            // Replicate the clone's UI message when queuing with country preference
+            if (preferSameCountry) {
+              send(ws, 'countryWait', "We're prioritizing people from your country right now.");
             }
           }
           break;
 
-        // 3. 1-on-1 Chat Routing
-        case 'message':
+
+        // --- 3. 1-on-1 Chat Routing ---
         case 'typing':
-          // If the user has a partner, forward the message ONLY to them
-          if (user.partner && user.partner.readyState === WebSocket.OPEN) {
-            user.partner.send(JSON.stringify({ channel, data }));
+          if (user.partner) {
+            send(user.partner, 'typing', data); // data is true/false
+          }
+          break;
+
+        case 'message':
+          if (user.partner) {
+            // Basic Anti-Bot/Spam Mitigation
+            user.msgCount++;
+            const msgText = (data || "").toLowerCase();
+            
+            // Drop instant telegram/snapchat bot links commonly found in these clones
+            if (msgText.includes('telegram @') || msgText.includes('snapchat:')) {
+               send(ws, 'disconnect', ''); // Boot the spammer
+               send(user.partner, 'disconnect', '');
+               const partnerData = users.get(user.partner);
+               if (partnerData) partnerData.partner = null;
+               user.partner = null;
+               break;
+            }
+
+            send(user.partner, 'message', data);
           }
           break;
 
         case 'disconnect':
-          // User manually skipped/disconnected
+          waitingQueue = waitingQueue.filter(client => client !== ws);
           if (user.partner) {
-            user.partner.send(JSON.stringify({ channel: 'disconnect', data: '' }));
-            users.get(user.partner).partner = null;
+            send(user.partner, 'disconnect', '');
+            const partnerData = users.get(user.partner);
+            if (partnerData) partnerData.partner = null;
             user.partner = null;
           }
           break;
       }
     } catch (err) {
-      console.error('Invalid JSON received:', err.message);
+      console.error('Invalid JSON received or processing error:', err.message);
     }
   });
 
   ws.on('close', () => {
     const user = users.get(ws);
     
-    // Remove from waiting queue if they were in it
+    // Clean up queue
     waitingQueue = waitingQueue.filter(client => client !== ws);
     
-    // Notify partner if they were in an active chat
-    if (user && user.partner && user.partner.readyState === WebSocket.OPEN) {
-      user.partner.send(JSON.stringify({ channel: 'disconnect', data: '' }));
-      users.get(user.partner).partner = null;
+    // Clean up partner connection
+    if (user && user.partner) {
+      send(user.partner, 'disconnect', '');
+      const partnerData = users.get(user.partner);
+      if (partnerData) partnerData.partner = null;
     }
     
     users.delete(ws);
-    
-    // Broadcast new user count
     broadcast('peopleOnline', users.size);
   });
 });
