@@ -1,7 +1,7 @@
 const WebSocket = require("ws");
 
 const PORT = process.env.PORT || 10000;
-const UPSTREAM_URL = "wss://YOUR-AUTHORIZED-UPSTREAM/";
+const UPSTREAM_URL = "wss://omegleweb.io:8443/";
 
 const server = new WebSocket.Server({ port: PORT });
 
