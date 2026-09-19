@@ -7,7 +7,7 @@ const wss = new WebSocketServer({ server });
 
 // Track all connected users and their metadata
 const users = new Map();
-// Array to hold users waiting for a stranger
+// Queue holding users waiting for a match
 let waitingQueue = [];
 
 // Helper to broadcast to all connected clients
@@ -18,24 +18,36 @@ function broadcast(channel, data) {
   });
 }
 
-// Helper to send messages safely
+// Helper to send messages safely to a single socket
 function send(ws, channel, data) {
-  if (ws.readyState === WebSocket.OPEN) {
+  if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ channel, data }));
   }
 }
 
 wss.on('connection', (ws) => {
-  // Initialize user state
-  users.set(ws, { 
-    id: Date.now(), 
-    partner: null, 
-    country: null,
-    countryName: null,
-    msgCount: 0 // Used for spam mitigation
+  // 1. Initialize user with a fallback country 
+  const initialCountry = {
+    countryCode: "IN",
+    countryName: "India"
+  };
+
+  users.set(ws, {
+    id: Date.now(),
+    partner: null,
+    countryCode: initialCountry.countryCode,
+    countryName: initialCountry.countryName,
+    msgCount: 0
   });
 
-  // Notify everyone a new user joined
+  // (Optional) Tell the client its own country immediately (mirroring the network dump)
+  send(ws, 'selfCountry', {
+    country: initialCountry.countryCode,
+    countryName: initialCountry.countryName,
+    available: true
+  });
+
+  // Broadcast current online count to update UI immediately
   broadcast('peopleOnline', users.size);
 
   ws.on('message', (rawMessage) => {
@@ -44,11 +56,12 @@ wss.on('connection', (ws) => {
       const { channel, data } = parsed;
       const user = users.get(ws);
 
+      if (!user) return;
+
       switch (channel) {
-        
-        // --- 1. Meta & Status Events ---
+        // --- Meta & Status ---
         case 'heartbeat':
-          // The client pings periodically to keep the connection alive. No response needed.
+          // Keep-alive ping from client, no action required
           break;
 
         case 'peopleOnline':
@@ -57,36 +70,34 @@ wss.on('connection', (ws) => {
 
         case 'selfCountry':
           if (data && data.country) {
-            user.country = data.country;
-            user.countryName = data.countryName;
+            user.countryCode = data.country;
+            user.countryName = data.countryName || data.country;
           }
           break;
 
         case 'userAFK':
-          // Forward AFK status to the partner if connected
           if (user.partner) {
-            send(user.partner, 'peerAFK', { 
-              timestamp: data.timestamp, 
-              reason: data.reason, 
-              gracePeriodMinutes: 8 
+            send(user.partner, 'peerAFK', {
+              timestamp: data?.timestamp || Date.now(),
+              reason: data?.reason || 'window_blur',
+              gracePeriodMinutes: 8
             });
           }
           break;
 
         case 'userActive':
           if (user.partner) {
-            send(user.partner, 'peerActive', { 
-              timestamp: data.timestamp, 
-              reason: data.reason, 
-              afkDurationSeconds: 0 
+            send(user.partner, 'peerActive', {
+              timestamp: data?.timestamp || Date.now(),
+              reason: data?.reason || 'window_focus',
+              afkDurationSeconds: 0
             });
           }
           break;
 
-
-        // --- 2. Matchmaking Engine ---
+        // --- Matchmaking Engine ---
         case 'match':
-          // Disconnect existing partner if matched
+          // Disconnect existing partner if user was already chatting and hit "skip"
           if (user.partner) {
             send(user.partner, 'disconnect', '');
             const partnerData = users.get(user.partner);
@@ -94,66 +105,59 @@ wss.on('connection', (ws) => {
             user.partner = null;
           }
 
-          // Remove self from queue to prevent self-matching
+          // Remove self from queue to prevent matching with self
           waitingQueue = waitingQueue.filter(client => client !== ws);
           user.msgCount = 0; // Reset spam counter for new match
 
-          // Extract match parameters
-          const preferSameCountry = data?.params?.preferSameCountry;
-          const interests = data?.params?.interests || [];
-
           if (waitingQueue.length > 0) {
-            let strangerIndex = 0;
-
-            // Optional: Implement logic here to loop through waitingQueue 
-            // and find someone with a matching country or interests.
-            // For now, it grabs the first person in the queue.
-            const stranger = waitingQueue.splice(strangerIndex, 1)[0];
+            // Stranger found! Remove them from the front of the queue
+            const stranger = waitingQueue.shift();
             const strangerData = users.get(stranger);
 
-            // Pair them up
+            // Link partners in memory
             user.partner = stranger;
             strangerData.partner = ws;
 
-            // Notify both clients they are connected
-            send(ws, 'connected', []);
-            send(stranger, 'connected', []);
+            // Send the exact 'match' event that chat.js expects
+            // NOTE: It requires 'countryCode', not 'country'
+            send(ws, 'match', {
+              countryCode: strangerData.countryCode || "IN",
+              countryName: strangerData.countryName || "India",
+              _pendingCommonInterests: [] 
+            });
 
-            // Swap country info
-            if (strangerData.country) {
-              send(ws, 'peerCountry', { country: strangerData.country, countryName: strangerData.countryName });
-            }
-            if (user.country) {
-              send(stranger, 'peerCountry', { country: user.country, countryName: user.countryName });
-            }
+            send(stranger, 'match', {
+              countryCode: user.countryCode || "IN",
+              countryName: user.countryName || "India",
+              _pendingCommonInterests: []
+            });
+
           } else {
-            // No one waiting. Add self to the queue.
+            // No one waiting -> add self to waiting queue
             waitingQueue.push(ws);
-            // Replicate the clone's UI message when queuing with country preference
-            if (preferSameCountry) {
+
+            if (data?.params?.preferSameCountry) {
               send(ws, 'countryWait', "We're prioritizing people from your country right now.");
             }
           }
           break;
 
-
-        // --- 3. 1-on-1 Chat Routing ---
+        // --- Chat & Typing Routing ---
         case 'typing':
           if (user.partner) {
-            send(user.partner, 'typing', data); // data is true/false
+            send(user.partner, 'typing', data); // data is a boolean
           }
           break;
 
         case 'message':
           if (user.partner) {
-            // Basic Anti-Bot/Spam Mitigation
             user.msgCount++;
             const msgText = (data || "").toLowerCase();
             
-            // Drop instant telegram/snapchat bot links commonly found in these clones
+            // Basic Anti-Bot Filter: Drop instant telegram/snapchat links common in these apps
             if (msgText.includes('telegram @') || msgText.includes('snapchat:')) {
                send(ws, 'disconnect', ''); // Boot the spammer
-               send(user.partner, 'disconnect', '');
+               send(user.partner, 'disconnect', ''); // Politely disconnect the innocent user
                const partnerData = users.get(user.partner);
                if (partnerData) partnerData.partner = null;
                user.partner = null;
@@ -165,6 +169,7 @@ wss.on('connection', (ws) => {
           break;
 
         case 'disconnect':
+          // User manually pressed skip/disconnect
           waitingQueue = waitingQueue.filter(client => client !== ws);
           if (user.partner) {
             send(user.partner, 'disconnect', '');
@@ -175,28 +180,29 @@ wss.on('connection', (ws) => {
           break;
       }
     } catch (err) {
-      console.error('Invalid JSON received or processing error:', err.message);
+      console.error('Error processing message:', err.message);
     }
   });
 
   ws.on('close', () => {
     const user = users.get(ws);
-    
-    // Clean up queue
+
+    // Remove from waiting queue if they drop connection
     waitingQueue = waitingQueue.filter(client => client !== ws);
-    
-    // Clean up partner connection
+
+    // Notify partner if they drop connection while actively chatting
     if (user && user.partner) {
       send(user.partner, 'disconnect', '');
       const partnerData = users.get(user.partner);
       if (partnerData) partnerData.partner = null;
     }
-    
+
     users.delete(ws);
+    // Broadcast updated online count to remaining users
     broadcast('peopleOnline', users.size);
   });
 });
 
 server.listen(PORT, () => {
-  console.log(`WebSocket Matchmaking Server listening on port ${PORT}`);
+  console.log(`WebSocket server listening on port ${PORT}`);
 });
