@@ -25,29 +25,29 @@ function send(ws, channel, data) {
   }
 }
 
-wss.on('connection', (ws) => {
-  // 1. Initialize user with a fallback country 
-  const initialCountry = {
-    countryCode: "IN",
-    countryName: "India"
-  };
+// When a new WebSocket connection is established
+wss.on('connection', (ws, req) => {
+  
+  // 1. Detect Country (Mocked to India for now. In production, use req.socket.remoteAddress + GeoIP library)
+  const detectedCountry = "IN";
+  const detectedCountryName = "India";
 
   users.set(ws, {
     id: Date.now(),
     partner: null,
-    countryCode: initialCountry.countryCode,
-    countryName: initialCountry.countryName,
+    country: detectedCountry,
+    countryName: detectedCountryName,
     msgCount: 0
   });
 
-  // (Optional) Tell the client its own country immediately (mirroring the network dump)
+  // 2. IMMEDIATELY send selfCountry on connection so the client knows its location
   send(ws, 'selfCountry', {
-    country: initialCountry.countryCode,
-    countryName: initialCountry.countryName,
+    country: detectedCountry,
+    countryName: detectedCountryName,
     available: true
   });
 
-  // Broadcast current online count to update UI immediately
+  // Broadcast current online count to update UI
   broadcast('peopleOnline', users.size);
 
   ws.on('message', (rawMessage) => {
@@ -61,18 +61,10 @@ wss.on('connection', (ws) => {
       switch (channel) {
         // --- Meta & Status ---
         case 'heartbeat':
-          // Keep-alive ping from client, no action required
           break;
 
         case 'peopleOnline':
           send(ws, 'peopleOnline', users.size);
-          break;
-
-        case 'selfCountry':
-          if (data && data.country) {
-            user.countryCode = data.country;
-            user.countryName = data.countryName || data.country;
-          }
           break;
 
         case 'userAFK':
@@ -97,7 +89,7 @@ wss.on('connection', (ws) => {
 
         // --- Matchmaking Engine ---
         case 'match':
-          // Disconnect existing partner if user was already chatting and hit "skip"
+          // Disconnect existing partner if user was already chatting
           if (user.partner) {
             send(user.partner, 'disconnect', '');
             const partnerData = users.get(user.partner);
@@ -107,7 +99,7 @@ wss.on('connection', (ws) => {
 
           // Remove self from queue to prevent matching with self
           waitingQueue = waitingQueue.filter(client => client !== ws);
-          user.msgCount = 0; // Reset spam counter for new match
+          user.msgCount = 0; 
 
           if (waitingQueue.length > 0) {
             // Stranger found! Remove them from the front of the queue
@@ -118,18 +110,19 @@ wss.on('connection', (ws) => {
             user.partner = stranger;
             strangerData.partner = ws;
 
-            // Send the exact 'match' event that chat.js expects
-            // NOTE: It requires 'countryCode', not 'country'
-            send(ws, 'match', {
-              countryCode: strangerData.countryCode || "IN",
-              countryName: strangerData.countryName || "India",
-              _pendingCommonInterests: [] 
+            // 3. EXACT SEQUENCE: Send 'connected' first
+            send(ws, 'connected', []);
+            send(stranger, 'connected', []);
+
+            // 4. EXACT SEQUENCE: Send 'peerCountry' immediately after
+            send(ws, 'peerCountry', {
+              country: strangerData.country || "IN",
+              countryName: strangerData.countryName || "India"
             });
 
-            send(stranger, 'match', {
-              countryCode: user.countryCode || "IN",
-              countryName: user.countryName || "India",
-              _pendingCommonInterests: []
+            send(stranger, 'peerCountry', {
+              country: user.country || "IN",
+              countryName: user.countryName || "India"
             });
 
           } else {
@@ -145,7 +138,7 @@ wss.on('connection', (ws) => {
         // --- Chat & Typing Routing ---
         case 'typing':
           if (user.partner) {
-            send(user.partner, 'typing', data); // data is a boolean
+            send(user.partner, 'typing', data); 
           }
           break;
 
@@ -154,10 +147,10 @@ wss.on('connection', (ws) => {
             user.msgCount++;
             const msgText = (data || "").toLowerCase();
             
-            // Basic Anti-Bot Filter: Drop instant telegram/snapchat links common in these apps
+            // Basic Anti-Bot Filter
             if (msgText.includes('telegram @') || msgText.includes('snapchat:')) {
-               send(ws, 'disconnect', ''); // Boot the spammer
-               send(user.partner, 'disconnect', ''); // Politely disconnect the innocent user
+               send(ws, 'disconnect', ''); 
+               send(user.partner, 'disconnect', ''); 
                const partnerData = users.get(user.partner);
                if (partnerData) partnerData.partner = null;
                user.partner = null;
@@ -169,7 +162,6 @@ wss.on('connection', (ws) => {
           break;
 
         case 'disconnect':
-          // User manually pressed skip/disconnect
           waitingQueue = waitingQueue.filter(client => client !== ws);
           if (user.partner) {
             send(user.partner, 'disconnect', '');
@@ -187,10 +179,8 @@ wss.on('connection', (ws) => {
   ws.on('close', () => {
     const user = users.get(ws);
 
-    // Remove from waiting queue if they drop connection
     waitingQueue = waitingQueue.filter(client => client !== ws);
 
-    // Notify partner if they drop connection while actively chatting
     if (user && user.partner) {
       send(user.partner, 'disconnect', '');
       const partnerData = users.get(user.partner);
@@ -198,7 +188,6 @@ wss.on('connection', (ws) => {
     }
 
     users.delete(ws);
-    // Broadcast updated online count to remaining users
     broadcast('peopleOnline', users.size);
   });
 });
