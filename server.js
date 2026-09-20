@@ -64,9 +64,6 @@ wss.on('connection', (ws, req) => {
       clientIp = clientIp.split(',')[0].trim(); // Handle multiple proxy IPs
   }
 
-  // Uncomment the next line if you want to see the Cloudflare headers in your terminal!
-  // console.log("Incoming IP:", clientIp, "Headers:", req.headers);
-
   // 2. Lookup the IP in the local GeoIP database
   const geo = geoip.lookup(clientIp);
   
@@ -91,6 +88,7 @@ wss.on('connection', (ws, req) => {
     countryName: detectedCountryName,
     interests: [],
     preferSameCountry: false,
+    webrtcOffer: null, // NEW: Stores the pre-generated video offer
     msgCount: 0
   });
 
@@ -115,6 +113,7 @@ wss.on('connection', (ws, req) => {
       switch (channel) {
         // --- Meta & Status ---
         case 'heartbeat':
+        case 'ping': // Added ping handler for video heartbeat
           break;
 
         case 'peopleOnline':
@@ -146,6 +145,9 @@ wss.on('connection', (ws, req) => {
           // 3. Update search preferences from client payload
           user.interests = data?.params?.interests || [];
           user.preferSameCountry = data?.params?.preferSameCountry || false;
+          
+          // NEW: Save the WebRTC Offer if they are on the video page
+          user.webrtcOffer = data?.params?.offer || null;
 
           let matchIndex = -1;
           let sharedInterests = [];
@@ -222,6 +224,14 @@ wss.on('connection', (ws, req) => {
               countryName: user.countryName || "Unknown"
             });
 
+            // 3. NEW: If on the video page, swap their pre-generated WebRTC offers immediately!
+            if (user.webrtcOffer) {
+              send(stranger, 'offer', user.webrtcOffer); 
+            }
+            if (strangerData.webrtcOffer) {
+              send(ws, 'offer', strangerData.webrtcOffer);
+            }
+
           } else {
             // NO MATCH FOUND -> Add to Queue
             waitingQueue.push(ws);
@@ -234,6 +244,31 @@ wss.on('connection', (ws, req) => {
             if (user.preferSameCountry) {
               send(ws, 'countryWait', "We're prioritizing people from your country right now.");
             }
+          }
+          break;
+
+        // --- WebRTC Video & Audio Routing ---
+        case 'description':   // Original Omegle SDP format
+        case 'offer':         // Video.js SDP format
+        case 'answer':        // Video.js SDP format
+        case 'iceCandidate':  // Original Omegle ICE format
+        case 'candidate':     // Video.js ICE format
+          if (user.partner) {
+            // Blindly forward the WebRTC payload to the stranger
+            send(user.partner, channel, data);
+          }
+          break;
+
+        case 'webcamLabel':
+          if (user.partner) {
+            // When User A sends their camera name, tell User B what it is
+            send(user.partner, 'peerWebcamLabel', data);
+          }
+          break;
+          
+        case 'requestWebcamValidation':
+          if (user.partner) {
+            send(user.partner, 'requestWebcamValidation', data);
           }
           break;
 
