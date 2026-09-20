@@ -6,7 +6,7 @@ const server = createServer();
 const wss = new WebSocketServer({ server });
 
 const users = new Map();
-let waitingQueue = [];
+let waitingQueue = []; // Array of WebSocket objects
 
 function broadcast(channel, data) {
   const payload = JSON.stringify({ channel, data });
@@ -28,8 +28,24 @@ function getCommonInterests(arr1, arr2) {
   return arr1.filter(i => lowerArr2.includes(i.toLowerCase()));
 }
 
+// --- QUEUE ANNOUNCER (Repeats wait messages) ---
+// Runs every 30 seconds to tell waiting users we are still looking
+setInterval(() => {
+  waitingQueue.forEach(ws => {
+    const user = users.get(ws);
+    if (!user) return;
+    
+    if (user.interests && user.interests.length > 0) {
+      send(ws, 'interestWait', "Finding someone who shares your interests may take a moment. If you get tired of waiting, you can");
+    } else if (user.preferSameCountry) {
+      send(ws, 'countryWait', "We're prioritizing people from your country right now.");
+    }
+  });
+}, 30000); // 30 seconds (Adjust if you want it faster/slower)
+
+
 wss.on('connection', (ws) => {
-  // Default connection values
+  // Default values (Replace with GeoIP lookup later if you want real locations)
   const detectedCountry = "IN";
   const detectedCountryName = "India";
 
@@ -43,6 +59,7 @@ wss.on('connection', (ws) => {
     msgCount: 0
   });
 
+  // Tell client their own country on connect
   send(ws, 'selfCountry', {
     country: detectedCountry,
     countryName: detectedCountryName,
@@ -61,6 +78,7 @@ wss.on('connection', (ws) => {
 
       switch (channel) {
         case 'heartbeat':
+          // Keep-alive from client
           break;
 
         case 'peopleOnline':
@@ -68,19 +86,15 @@ wss.on('connection', (ws) => {
           break;
 
         case 'userAFK':
-          if (user.partner) {
-            send(user.partner, 'peerAFK', { timestamp: Date.now(), reason: 'window_blur', gracePeriodMinutes: 8 });
-          }
+          if (user.partner) send(user.partner, 'peerAFK', { timestamp: Date.now(), reason: 'window_blur', gracePeriodMinutes: 8 });
           break;
 
         case 'userActive':
-          if (user.partner) {
-            send(user.partner, 'peerActive', { timestamp: Date.now(), reason: 'window_focus', afkDurationSeconds: 0 });
-          }
+          if (user.partner) send(user.partner, 'peerActive', { timestamp: Date.now(), reason: 'window_focus', afkDurationSeconds: 0 });
           break;
 
         case 'match':
-          // 1. Disconnect existing partner if skipping
+          // 1. Disconnect existing partner if user is skipping
           if (user.partner) {
             send(user.partner, 'disconnect', '');
             const partnerData = users.get(user.partner);
@@ -88,32 +102,29 @@ wss.on('connection', (ws) => {
             user.partner = null;
           }
 
+          // 2. Remove self from queue while processing
           waitingQueue = waitingQueue.filter(client => client !== ws);
           user.msgCount = 0; 
           
-          // 2. Save the search parameters (If they clicked the UI button, this array will be empty!)
+          // 3. Update search preferences from client payload
           user.interests = data?.params?.interests || [];
           user.preferSameCountry = data?.params?.preferSameCountry || false;
 
           let matchIndex = -1;
           let sharedInterests = [];
 
-          // PASS 1: Strict Match (Interests must match AND Country Preference must match)
+          // PASS 1: Strict Match (Interests AND Country)
           for (let i = 0; i < waitingQueue.length; i++) {
             const pData = users.get(waitingQueue[i]);
-            
             let interestMatch = false;
             let intersect = [];
             
-            // If either user has interests, they MUST share at least one
             if (user.interests.length > 0 || pData.interests.length > 0) {
               intersect = getCommonInterests(user.interests, pData.interests);
               if (intersect.length > 0) interestMatch = true;
             } else {
-              // Both users have 0 interests, they match perfectly
-              interestMatch = true; 
+              interestMatch = true; // Both have 0 interests
             }
-            
             if (!interestMatch) continue;
 
             let countryMatch = true;
@@ -127,11 +138,10 @@ wss.on('connection', (ws) => {
             }
           }
 
-          // PASS 2: Fallback Match (Ignore Country, but Interests MUST still match)
+          // PASS 2: Fallback Match (Interests only, ignore country)
           if (matchIndex === -1) {
             for (let i = 0; i < waitingQueue.length; i++) {
               const pData = users.get(waitingQueue[i]);
-              
               let interestMatch = false;
               let intersect = [];
               
@@ -152,16 +162,20 @@ wss.on('connection', (ws) => {
 
           // === RESULT HANDLING ===
           if (matchIndex !== -1) {
-            // WE FOUND A MATCH!
+            // MATCH FOUND!
             const stranger = waitingQueue.splice(matchIndex, 1)[0];
             const strangerData = users.get(stranger);
 
             user.partner = stranger;
             strangerData.partner = ws;
 
-            send(ws, 'connected', []);
-            send(stranger, 'connected', []);
+            // 1. Send 'connected' containing the array of shared interests
+            // (e.g., {"channel":"connected","data":["love"]})
+            send(ws, 'connected', sharedInterests);
+            send(stranger, 'connected', sharedInterests);
 
+            // 2. Send 'peerCountry' immediately after
+            // (e.g., {"channel":"peerCountry","data":{"country":"NL","countryName":"Netherlands"}})
             send(ws, 'peerCountry', {
               country: strangerData.country || "IN",
               countryName: strangerData.countryName || "India"
@@ -171,22 +185,11 @@ wss.on('connection', (ws) => {
               countryName: user.countryName || "India"
             });
 
-            send(ws, 'match', {
-              countryCode: strangerData.country || "IN",
-              countryName: strangerData.countryName || "India",
-              _pendingCommonInterests: sharedInterests 
-            });
-            send(stranger, 'match', {
-              countryCode: user.country || "IN",
-              countryName: user.countryName || "India",
-              _pendingCommonInterests: sharedInterests
-            });
-
           } else {
-            // NO MATCH FOUND -> Add to Queue (No automatic random matches anymore!)
+            // NO MATCH FOUND -> Add to Queue
             waitingQueue.push(ws);
 
-            // Send the exact wait messages based on what they are looking for
+            // Send the first wait message immediately
             if (user.interests.length > 0) {
               send(ws, 'interestWait', "Finding someone who shares your interests may take a moment. If you get tired of waiting, you can");
             } else if (user.preferSameCountry) {
@@ -204,6 +207,7 @@ wss.on('connection', (ws) => {
             user.msgCount++;
             const msgText = (data || "").toLowerCase();
             
+            // Basic Anti-Bot Filter
             if (msgText.includes('telegram @') || msgText.includes('snapchat:')) {
                send(ws, 'disconnect', ''); 
                send(user.partner, 'disconnect', ''); 
