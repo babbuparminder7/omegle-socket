@@ -1,5 +1,6 @@
 const { createServer } = require('http');
 const { WebSocketServer, WebSocket } = require('ws');
+const geoip = require('geoip-lite');
 
 const PORT = process.env.PORT || 3000;
 const server = createServer();
@@ -9,6 +10,9 @@ const wss = new WebSocketServer({ server });
 const users = new Map();
 // Queue holding users waiting for a match
 let waitingQueue = []; 
+
+// Built-in Node.js formatter to convert country codes ("US") to full names ("United States")
+const regionNames = new Intl.DisplayNames(['en'], { type: 'region' });
 
 // Helper to broadcast to all connected clients
 function broadcast(channel, data) {
@@ -51,11 +55,35 @@ setInterval(() => {
 }, 30000); // 30 seconds
 
 
-wss.on('connection', (ws) => {
-  // Default values (Replace with GeoIP lookup later if you want real IP locations)
-  const detectedCountry = "IN";
-  const detectedCountryName = "India";
+wss.on('connection', (ws, req) => {
+  
+  // --- REAL COUNTRY DETECTION ---
+  // 1. Get the user's real IP address (supports Cloudflare, Nginx proxies, or direct connections)
+  let clientIp = req.headers['cf-connecting-ip'] || req.headers['x-forwarded-for'] || req.socket.remoteAddress || '';
+  if (clientIp.includes(',')) {
+      clientIp = clientIp.split(',')[0].trim(); // Handle multiple proxy IPs
+  }
 
+  // Uncomment the next line if you want to see the Cloudflare headers in your terminal!
+  // console.log("Incoming IP:", clientIp, "Headers:", req.headers);
+
+  // 2. Lookup the IP in the local GeoIP database
+  const geo = geoip.lookup(clientIp);
+  
+  // 3. Set the country code (fallback to 'XX' if running on localhost)
+  const detectedCountry = geo ? geo.country : 'XX'; 
+  
+  // 4. Convert code to Full Name (e.g. IN -> India)
+  let detectedCountryName = 'Unknown';
+  if (geo && geo.country) {
+      try {
+          detectedCountryName = regionNames.of(geo.country);
+      } catch (e) {
+          detectedCountryName = geo.country;
+      }
+  }
+
+  // Initialize user profile
   users.set(ws, {
     id: Date.now(),
     partner: null,
@@ -66,11 +94,11 @@ wss.on('connection', (ws) => {
     msgCount: 0
   });
 
-  // Tell client their own country on connect
+  // Tell client their own detected country on connect
   send(ws, 'selfCountry', {
     country: detectedCountry,
     countryName: detectedCountryName,
-    available: true
+    available: detectedCountry !== 'XX' // Disable same-country matching if localhost/unknown
   });
 
   // Broadcast current online count to update UI
@@ -87,7 +115,6 @@ wss.on('connection', (ws) => {
       switch (channel) {
         // --- Meta & Status ---
         case 'heartbeat':
-          // Keep-alive ping from client
           break;
 
         case 'peopleOnline':
@@ -187,12 +214,12 @@ wss.on('connection', (ws) => {
 
             // 2. Send 'peerCountry' immediately after
             send(ws, 'peerCountry', {
-              country: strangerData.country || "IN",
-              countryName: strangerData.countryName || "India"
+              country: strangerData.country || "XX",
+              countryName: strangerData.countryName || "Unknown"
             });
             send(stranger, 'peerCountry', {
-              country: user.country || "IN",
-              countryName: user.countryName || "India"
+              country: user.country || "XX",
+              countryName: user.countryName || "Unknown"
             });
 
           } else {
