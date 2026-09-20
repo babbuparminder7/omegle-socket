@@ -5,9 +5,12 @@ const PORT = process.env.PORT || 3000;
 const server = createServer();
 const wss = new WebSocketServer({ server });
 
+// Track all connected users and their metadata
 const users = new Map();
-let waitingQueue = []; // Array of WebSocket objects
+// Queue holding users waiting for a match
+let waitingQueue = []; 
 
+// Helper to broadcast to all connected clients
 function broadcast(channel, data) {
   const payload = JSON.stringify({ channel, data });
   wss.clients.forEach(client => {
@@ -15,6 +18,7 @@ function broadcast(channel, data) {
   });
 }
 
+// Helper to send messages safely to a single socket
 function send(ws, channel, data) {
   if (ws && ws.readyState === WebSocket.OPEN) {
     ws.send(JSON.stringify({ channel, data }));
@@ -35,17 +39,20 @@ setInterval(() => {
     const user = users.get(ws);
     if (!user) return;
     
+    // Send independent wait messages. Order: Interest first, then Country.
     if (user.interests && user.interests.length > 0) {
       send(ws, 'interestWait', "Finding someone who shares your interests may take a moment. If you get tired of waiting, you can");
-    } else if (user.preferSameCountry) {
+    }
+    
+    if (user.preferSameCountry) {
       send(ws, 'countryWait', "We're prioritizing people from your country right now.");
     }
   });
-}, 30000); // 30 seconds (Adjust if you want it faster/slower)
+}, 30000); // 30 seconds
 
 
 wss.on('connection', (ws) => {
-  // Default values (Replace with GeoIP lookup later if you want real locations)
+  // Default values (Replace with GeoIP lookup later if you want real IP locations)
   const detectedCountry = "IN";
   const detectedCountryName = "India";
 
@@ -66,6 +73,7 @@ wss.on('connection', (ws) => {
     available: true
   });
 
+  // Broadcast current online count to update UI
   broadcast('peopleOnline', users.size);
 
   ws.on('message', (rawMessage) => {
@@ -77,8 +85,9 @@ wss.on('connection', (ws) => {
       if (!user) return;
 
       switch (channel) {
+        // --- Meta & Status ---
         case 'heartbeat':
-          // Keep-alive from client
+          // Keep-alive ping from client
           break;
 
         case 'peopleOnline':
@@ -93,6 +102,7 @@ wss.on('connection', (ws) => {
           if (user.partner) send(user.partner, 'peerActive', { timestamp: Date.now(), reason: 'window_focus', afkDurationSeconds: 0 });
           break;
 
+        // --- Matchmaking Engine ---
         case 'match':
           // 1. Disconnect existing partner if user is skipping
           if (user.partner) {
@@ -102,7 +112,7 @@ wss.on('connection', (ws) => {
             user.partner = null;
           }
 
-          // 2. Remove self from queue while processing
+          // 2. Remove self from queue while processing to prevent self-match
           waitingQueue = waitingQueue.filter(client => client !== ws);
           user.msgCount = 0; 
           
@@ -119,6 +129,7 @@ wss.on('connection', (ws) => {
             let interestMatch = false;
             let intersect = [];
             
+            // Check Interests
             if (user.interests.length > 0 || pData.interests.length > 0) {
               intersect = getCommonInterests(user.interests, pData.interests);
               if (intersect.length > 0) interestMatch = true;
@@ -127,6 +138,7 @@ wss.on('connection', (ws) => {
             }
             if (!interestMatch) continue;
 
+            // Check Country
             let countryMatch = true;
             if (user.preferSameCountry && user.country !== pData.country) countryMatch = false;
             if (pData.preferSameCountry && pData.country !== user.country) countryMatch = false;
@@ -170,12 +182,10 @@ wss.on('connection', (ws) => {
             strangerData.partner = ws;
 
             // 1. Send 'connected' containing the array of shared interests
-            // (e.g., {"channel":"connected","data":["love"]})
             send(ws, 'connected', sharedInterests);
             send(stranger, 'connected', sharedInterests);
 
             // 2. Send 'peerCountry' immediately after
-            // (e.g., {"channel":"peerCountry","data":{"country":"NL","countryName":"Netherlands"}})
             send(ws, 'peerCountry', {
               country: strangerData.country || "IN",
               countryName: strangerData.countryName || "India"
@@ -189,15 +199,18 @@ wss.on('connection', (ws) => {
             // NO MATCH FOUND -> Add to Queue
             waitingQueue.push(ws);
 
-            // Send the first wait message immediately
+            // Send independent wait messages. Order: Interest first, then Country.
             if (user.interests.length > 0) {
               send(ws, 'interestWait', "Finding someone who shares your interests may take a moment. If you get tired of waiting, you can");
-            } else if (user.preferSameCountry) {
+            }
+            
+            if (user.preferSameCountry) {
               send(ws, 'countryWait', "We're prioritizing people from your country right now.");
             }
           }
           break;
 
+        // --- Chat & Typing Routing ---
         case 'typing':
           if (user.partner) send(user.partner, 'typing', data); 
           break;
@@ -207,7 +220,7 @@ wss.on('connection', (ws) => {
             user.msgCount++;
             const msgText = (data || "").toLowerCase();
             
-            // Basic Anti-Bot Filter
+            // Basic Anti-Bot Filter (Drops connection for fast bot links)
             if (msgText.includes('telegram @') || msgText.includes('snapchat:')) {
                send(ws, 'disconnect', ''); 
                send(user.partner, 'disconnect', ''); 
